@@ -14,6 +14,28 @@ namespace {
 constexpr int kProbeTimeoutMs = 15000;
 // Poll granularity while waiting on a thumbnail child, so cancellation is prompt.
 constexpr int kThumbPollMs = 50;
+
+// ffprobe reports rotation either as stream side data or, on older files, as a
+// "rotate" tag — and either one can come back as a string.
+int rotationOf(const QJsonObject &stream) {
+    double degrees = 0.0;
+    const QJsonArray sideData = stream.value("side_data_list").toArray();
+    for (const QJsonValue &entry : sideData) {
+        const QJsonValue rotation = entry.toObject().value("rotation");
+        if (rotation.isUndefined())
+            continue;
+        degrees = rotation.isString() ? rotation.toString().toDouble() : rotation.toDouble();
+    }
+    if (degrees == 0.0)
+        degrees = stream.value("tags").toObject().value("rotate").toString().toDouble();
+
+    int normalised = qRound(degrees) % 360;
+    if (normalised < 0)
+        normalised += 360;
+    // Anything that isn't a quarter turn can't swap the sides, so treat it as
+    // upright rather than guessing.
+    return (normalised % 90 == 0) ? normalised : 0;
+}
 }
 
 QString toolPath(const QString &tool) {
@@ -65,6 +87,10 @@ VideoInfo probe(const QString &path) {
 
     info.width = stream.value("width").toInt();
     info.height = stream.value("height").toInt();
+    info.rotation = rotationOf(stream);
+    const bool quarterTurn = info.rotation == 90 || info.rotation == 270;
+    info.displayWidth = quarterTurn ? info.height : info.width;
+    info.displayHeight = quarterTurn ? info.width : info.height;
 
     // Duration can live on the stream or on the container.
     QString durationStr = stream.value("duration").toString();
@@ -123,8 +149,20 @@ QImage thumbnail(const QString &path, double time, int height,
     return img;
 }
 
+QString escapeFilterPath(const QString &path) {
+    static const QString specials = QStringLiteral("\\':[],;");
+    QString escaped;
+    escaped.reserve(path.size());
+    for (const QChar ch : path) {
+        if (specials.contains(ch))
+            escaped += QLatin1Char('\\');
+        escaped += ch;
+    }
+    return escaped;
+}
+
 QStringList trimArgs(const QString &src, const QString &dst, double start, double end,
-                     int scaleHeight) {
+                     int scaleHeight, const QString &assPath) {
     // Machine-readable progress on stdout (errors stay on stderr), so the UI
     // can show how far along the encode is.
     QStringList args = {"-y", "-loglevel", "error", "-progress", "pipe:1"};
@@ -137,9 +175,15 @@ QStringList trimArgs(const QString &src, const QString &dst, double start, doubl
     // Cap the shorter side, judged on the decoded (rotation-applied) frame, so
     // portrait and landscape both keep their aspect ratio. -2 keeps the other
     // side divisible by two, which libx264 requires.
+    QStringList filters;
     if (scaleHeight > 0)
-        args << "-vf"
-             << QString("scale='if(gt(iw,ih),-2,%1)':'if(gt(iw,ih),%1,-2)'").arg(scaleHeight);
+        filters << QString("scale='if(gt(iw,ih),-2,%1)':'if(gt(iw,ih),%1,-2)'").arg(scaleHeight);
+    // Captions come last: libass then draws them at the output resolution, so
+    // a downscaled export gets crisp text instead of resampled text.
+    if (!assPath.isEmpty())
+        filters << QString("subtitles=filename=%1").arg(escapeFilterPath(assPath));
+    if (!filters.isEmpty())
+        args << "-vf" << filters.join(QLatin1Char(','));
     args << "-c:v" << "libx264" << "-preset" << "veryfast"
          << "-crf" << "18" << "-c:a" << "aac"
          << "-movflags" << "+faststart"

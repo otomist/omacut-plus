@@ -21,6 +21,19 @@ ApplicationWindow {
     property string noticeText: ""
     property bool helpVisible: false
     property bool quitConfirmVisible: false
+    // Subtitle mode: the caption lane and its editor, on top of everything the
+    // trimmer already does.
+    property bool captionMode: false
+    property bool styleVisible: false
+    property int selectedCaption: -1
+    readonly property bool hasCaptions: captionModel.count > 0
+    // The caption on screen at the playhead — what the export would burn into
+    // this frame. captionRevision is in the call only to re-run the binding
+    // when the captions themselves change.
+    readonly property string activeCaptionText: captionTextAt(trimBar.playheadSec, captionRevision)
+    // Single-key shortcuts go quiet while something has the keyboard, or typing
+    // "z" into a caption would zoom the timeline instead of writing a z.
+    readonly property bool typing: captionField.activeFocus || styleVisible
     readonly property string statusText: noticeText !== "" ? noticeText : backend.status
 
     // What the last export wrote, so quitting only warns about unexported work.
@@ -29,9 +42,15 @@ ApplicationWindow {
     property real exportedEndSec: -1
     property real pendingExportStartSec: 0
     property real pendingExportEndSec: 0
+    // Bumped by every caption edit, so an export can mark exactly the captions
+    // it wrote as saved.
+    property int captionRevision: 0
+    property int exportedCaptionRevision: 0
+    property int pendingCaptionRevision: 0
     readonly property bool trimDirty: hasVideo && backend.duration > 0
-        && (trimBar.startSec > 0 || trimBar.endSec < backend.duration)
-        && (trimBar.startSec !== exportedStartSec || trimBar.endSec !== exportedEndSec)
+        && (trimBar.startSec > 0 || trimBar.endSec < backend.duration || hasCaptions)
+        && (trimBar.startSec !== exportedStartSec || trimBar.endSec !== exportedEndSec
+            || captionRevision !== exportedCaptionRevision)
 
     Material.theme: Material.Dark
     Material.accent: win.accent
@@ -53,6 +72,7 @@ ApplicationWindow {
             return;
         pendingExportStartSec = trimBar.startSec;
         pendingExportEndSec = trimBar.endSec;
+        pendingCaptionRevision = captionRevision;
         backend.exportDialog(trimBar.startSec, trimBar.endSec);
     }
     function ensureAudioOutput() {
@@ -115,6 +135,169 @@ ApplicationWindow {
         trimBar.endSec = Math.min(trimBar.windowEnd, Math.max(seconds, trimBar.startSec + minGap));
         movePlayheadTo(trimBar.endSec);
     }
+    // Captions, in playback order, timed against the source video.
+    ListModel {
+        id: captionModel
+    }
+
+    // The one look they all share. The style panel edits this in place and
+    // syncCaptions() ships it to the backend.
+    QtObject {
+        id: captionStyle
+        property string fontFamily: win.defaultCaptionFont()
+        property int fontSize: 72
+        property bool bold: true
+        property string textColor: "#ffffff"
+        property string outlineColor: "#000000"
+        property int outlineWidth: 5
+        property bool box: false
+        property string boxColor: "#000000"
+        property int boxOpacity: 70
+        property int marginV: 80
+    }
+
+    // A heavy, wide sans reads best over video; fall through what's commonly
+    // installed before settling for whatever the system hands us.
+    function defaultCaptionFont() {
+        var preferred = ["Inter", "Poppins", "Montserrat", "Archivo", "Adwaita Sans",
+                         "DejaVu Sans", "Noto Sans", "Liberation Sans"];
+        var families = Qt.fontFamilies();
+        for (var i = 0; i < preferred.length; ++i) {
+            if (families.indexOf(preferred[i]) >= 0)
+                return preferred[i];
+        }
+        return Qt.application.font.family;
+    }
+
+    // Caption sizes are in the video's own pixels, so the defaults are a share
+    // of its height: the same caption looks the same on a 4K and a 720p source.
+    function resetCaptionStyle() {
+        var h = backend.videoHeight > 0 ? backend.videoHeight : 1080;
+        captionStyle.fontFamily = defaultCaptionFont();
+        captionStyle.fontSize = Math.max(12, Math.round(h * 0.075));
+        captionStyle.bold = true;
+        captionStyle.textColor = "#ffffff";
+        captionStyle.outlineColor = "#000000";
+        captionStyle.outlineWidth = Math.max(2, Math.round(h * 0.0054));
+        captionStyle.box = false;
+        captionStyle.boxColor = "#000000";
+        captionStyle.boxOpacity = 70;
+        captionStyle.marginV = Math.round(h * 0.08);
+    }
+
+    function captionStyleMap() {
+        return {
+            fontFamily: captionStyle.fontFamily,
+            fontSize: captionStyle.fontSize,
+            bold: captionStyle.bold,
+            textColor: captionStyle.textColor,
+            outlineColor: captionStyle.outlineColor,
+            outlineWidth: captionStyle.outlineWidth,
+            box: captionStyle.box,
+            boxColor: captionStyle.boxColor,
+            boxOpacity: captionStyle.boxOpacity,
+            marginV: captionStyle.marginV
+        };
+    }
+
+    // Every caption edit ends up here: the backend holds the list the export
+    // burns in, and the revision marks the work as unexported.
+    function syncCaptions() {
+        var cues = [];
+        for (var i = 0; i < captionModel.count; ++i) {
+            var cue = captionModel.get(i);
+            cues.push({ start: cue.startSec, end: cue.endSec, text: cue.text });
+        }
+        backend.setCaptions(cues, captionStyleMap());
+        ++captionRevision;
+    }
+
+    function captionTextAt(seconds, revision) {
+        for (var i = 0; i < captionModel.count; ++i) {
+            var cue = captionModel.get(i);
+            if (seconds >= cue.startSec && seconds <= cue.endSec)
+                return cue.text;
+        }
+        return "";
+    }
+
+    // New captions run two seconds from where they're dropped, trimmed to what
+    // is left of the video.
+    function addCaptionAt(seconds) {
+        if (!hasVideo || backend.duration <= 0)
+            return;
+        captionMode = true;
+        var start = Math.max(0, Math.min(seconds, backend.duration - 0.2));
+        var end = Math.min(start + 2, backend.duration);
+        // Keep the list in playback order, so the lane reads left to right.
+        var at = captionModel.count;
+        for (var i = 0; i < captionModel.count; ++i) {
+            if (captionModel.get(i).startSec > start) {
+                at = i;
+                break;
+            }
+        }
+        captionModel.insert(at, { startSec: start, endSec: end, text: "" });
+        selectCaption(at);
+        syncCaptions();
+        captionField.forceActiveFocus();
+    }
+    function addCaption() {
+        addCaptionAt(trimBar.playheadSec);
+    }
+
+    function deleteCaption() {
+        if (selectedCaption < 0 || selectedCaption >= captionModel.count)
+            return;
+        captionModel.remove(selectedCaption);
+        selectCaption(Math.min(selectedCaption, captionModel.count - 1));
+        syncCaptions();
+    }
+
+    function selectCaption(index) {
+        selectedCaption = index >= 0 && index < captionModel.count ? index : -1;
+        captionField.text = selectedCaption >= 0 ? captionModel.get(selectedCaption).text : "";
+    }
+
+    function setCaptionText(text) {
+        if (selectedCaption < 0)
+            return;
+        captionModel.setProperty(selectedCaption, "text", text);
+        syncCaptions();
+    }
+
+    function retimeCaption(index, start, end) {
+        if (index < 0 || index >= captionModel.count)
+            return;
+        var cue = captionModel.get(index);
+        var startMoved = start !== cue.startSec;
+        if (!startMoved && end === cue.endSec)
+            return;  // a drag that hasn't moved far enough to change anything
+        captionModel.setProperty(index, "startSec", start);
+        captionModel.setProperty(index, "endSec", end);
+        // Park the playhead on the edge that moved, the same way dragging a trim
+        // handle does, so you see the frame the caption now starts or ends on.
+        movePlayheadTo(startMoved ? start : end);
+        syncCaptions();
+    }
+
+    // [ and ] pull the selected caption's edges to the playhead, the caption
+    // counterpart of the Ctrl/Alt+Space trim chords.
+    function setCaptionEdge(isStart) {
+        if (selectedCaption < 0)
+            return;
+        var cue = captionModel.get(selectedCaption);
+        var minLen = 0.2;
+        if (isStart)
+            retimeCaption(selectedCaption,
+                          Math.max(0, Math.min(trimBar.playheadSec, cue.endSec - minLen)),
+                          cue.endSec);
+        else
+            retimeCaption(selectedCaption, cue.startSec,
+                          Math.min(backend.duration,
+                                   Math.max(trimBar.playheadSec, cue.startSec + minLen)));
+    }
+
     property bool quitting: false
     function requestQuit() {
         if (trimDirty) {
@@ -164,70 +347,70 @@ ApplicationWindow {
     Shortcut {
         sequence: "Space"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && !win.quitConfirmVisible
+        enabled: win.hasVideo && !win.quitConfirmVisible && !win.typing
         onActivated: togglePlay()
     }
 
     Shortcut {
         sequence: "Ctrl+Space"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && !win.quitConfirmVisible
+        enabled: win.hasVideo && !win.quitConfirmVisible && !win.typing
         onActivated: moveTrimStartTo(trimBar.playheadSec)
     }
 
     Shortcut {
         sequence: "Alt+Space"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && !win.quitConfirmVisible
+        enabled: win.hasVideo && !win.quitConfirmVisible && !win.typing
         onActivated: moveTrimEndTo(trimBar.playheadSec)
     }
 
     Shortcut {
         sequence: "Left"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && !win.quitConfirmVisible
+        enabled: win.hasVideo && !win.quitConfirmVisible && !win.typing
         onActivated: seekBy(-1)
     }
 
     Shortcut {
         sequence: "Right"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && !win.quitConfirmVisible
+        enabled: win.hasVideo && !win.quitConfirmVisible && !win.typing
         onActivated: seekBy(1)
     }
 
     Shortcut {
         sequence: "Shift+Left"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && !win.quitConfirmVisible
+        enabled: win.hasVideo && !win.quitConfirmVisible && !win.typing
         onActivated: seekBy(-5)
     }
 
     Shortcut {
         sequence: "Shift+Right"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && !win.quitConfirmVisible
+        enabled: win.hasVideo && !win.quitConfirmVisible && !win.typing
         onActivated: seekBy(5)
     }
 
     Shortcut {
         sequence: "Alt+Left"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && !win.quitConfirmVisible
+        enabled: win.hasVideo && !win.quitConfirmVisible && !win.typing
         onActivated: seekBy(-0.2)
     }
 
     Shortcut {
         sequence: "Alt+Right"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && !win.quitConfirmVisible
+        enabled: win.hasVideo && !win.quitConfirmVisible && !win.typing
         onActivated: seekBy(0.2)
     }
 
     Shortcut {
         sequence: "Z"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && backend.duration > 0 && !win.quitConfirmVisible
+        enabled: win.hasVideo && backend.duration > 0 && !win.quitConfirmVisible && !win.typing
         onActivated: {
             trimBar.toggleZoom();
             backend.requestThumbs(trimBar.windowStart, trimBar.windowEnd);
@@ -244,6 +427,42 @@ ApplicationWindow {
         }
     }
 
+    // --- subtitle mode ---
+    Shortcut {
+        sequence: "C"
+        context: Qt.ApplicationShortcut
+        enabled: win.hasVideo && backend.duration > 0 && !win.quitConfirmVisible && !win.typing
+        onActivated: win.captionMode = !win.captionMode
+    }
+
+    Shortcut {
+        sequence: "T"
+        context: Qt.ApplicationShortcut
+        enabled: win.hasVideo && backend.duration > 0 && !win.quitConfirmVisible && !win.typing
+        onActivated: win.addCaption()
+    }
+
+    Shortcut {
+        sequence: "["
+        context: Qt.ApplicationShortcut
+        enabled: win.selectedCaption >= 0 && !win.quitConfirmVisible && !win.typing
+        onActivated: win.setCaptionEdge(true)
+    }
+
+    Shortcut {
+        sequence: "]"
+        context: Qt.ApplicationShortcut
+        enabled: win.selectedCaption >= 0 && !win.quitConfirmVisible && !win.typing
+        onActivated: win.setCaptionEdge(false)
+    }
+
+    Shortcut {
+        sequence: "Delete"
+        context: Qt.ApplicationShortcut
+        enabled: win.selectedCaption >= 0 && !win.quitConfirmVisible && !win.typing
+        onActivated: win.deleteCaption()
+    }
+
     Shortcut {
         sequence: "Ctrl+O"
         context: Qt.ApplicationShortcut
@@ -254,6 +473,7 @@ ApplicationWindow {
     Shortcut {
         sequence: "Q"
         context: Qt.ApplicationShortcut
+        enabled: !win.typing
         onActivated: {
             if (!win.quitConfirmVisible)
                 requestQuit();
@@ -263,6 +483,7 @@ ApplicationWindow {
     Shortcut {
         sequence: "?"
         context: Qt.ApplicationShortcut
+        enabled: !win.typing
         onActivated: {
             if (!win.quitConfirmVisible)
                 win.helpVisible = !win.helpVisible;
@@ -275,6 +496,10 @@ ApplicationWindow {
         onActivated: {
             if (win.quitConfirmVisible)
                 win.quitConfirmVisible = false;
+            else if (win.styleVisible)
+                win.styleVisible = false;
+            else if (captionField.activeFocus)
+                captionField.focus = false;
             else if (win.helpVisible)
                 win.helpVisible = false;
         }
@@ -353,8 +578,10 @@ ApplicationWindow {
 
     component DialogButton: Rectangle {
         id: dialogButton
-        width: dialogButtonLabel.implicitWidth + 28
-        height: 34
+        // Implicit, not explicit: a Row leaves the size alone and a Layout can
+        // still place it (the caption editor puts these in a RowLayout).
+        implicitWidth: dialogButtonLabel.implicitWidth + 28
+        implicitHeight: 34
         radius: 8
 
         property string text: ""
@@ -428,6 +655,36 @@ ApplicationWindow {
                     ctx.lineTo(19, 12);
                     ctx.closePath();
                     ctx.fill();
+                } else if (iconButton.iconName === "text") {
+                    // A capital T: the subtitle mode toggle.
+                    ctx.beginPath();
+                    ctx.moveTo(5, 6);
+                    ctx.lineTo(19, 6);
+                    ctx.stroke();
+
+                    ctx.beginPath();
+                    ctx.moveTo(12, 6);
+                    ctx.lineTo(12, 19);
+                    ctx.stroke();
+                } else if (iconButton.iconName === "trash") {
+                    ctx.beginPath();
+                    ctx.moveTo(5, 7);
+                    ctx.lineTo(19, 7);
+                    ctx.stroke();
+
+                    ctx.beginPath();
+                    ctx.moveTo(10, 7);
+                    ctx.lineTo(10, 4);
+                    ctx.lineTo(14, 4);
+                    ctx.lineTo(14, 7);
+                    ctx.stroke();
+
+                    ctx.beginPath();
+                    ctx.moveTo(7, 7);
+                    ctx.lineTo(8, 20);
+                    ctx.lineTo(16, 20);
+                    ctx.lineTo(17, 7);
+                    ctx.stroke();
                 } else if (iconButton.iconName === "download") {
                     ctx.beginPath();
                     ctx.moveTo(12, 4);
@@ -492,6 +749,25 @@ ApplicationWindow {
                 onClicked: openVideo()
             }
 
+            // What the export will burn in, drawn where it will end up.
+            CaptionOverlay {
+                anchors.fill: parent
+                visible: win.hasVideo
+                text: win.activeCaptionText
+                videoRect: videoOut.contentRect
+                videoPixelHeight: backend.videoHeight
+                fontFamily: captionStyle.fontFamily
+                fontSize: captionStyle.fontSize
+                bold: captionStyle.bold
+                textColor: captionStyle.textColor
+                outlineColor: captionStyle.outlineColor
+                outlineWidth: captionStyle.outlineWidth
+                box: captionStyle.box
+                boxColor: captionStyle.boxColor
+                boxOpacity: captionStyle.boxOpacity
+                marginV: captionStyle.marginV
+            }
+
             Button {
                 id: openVideoButton
                 anchors.centerIn: parent
@@ -545,10 +821,109 @@ ApplicationWindow {
             IconButton {
                 Layout.preferredWidth: 44
                 Layout.preferredHeight: 44
+                iconName: "text"
+                tipText: win.captionMode ? "Close the subtitle editor (C)" : "Add subtitles (C)"
+                buttonColor: win.captionMode ? win.accent : "#2c2c2f"
+                iconColor: win.captionMode ? win.accentForeground : "white"
+                enabled: backend.duration > 0
+                onClicked: win.captionMode = !win.captionMode
+            }
+
+            IconButton {
+                Layout.preferredWidth: 44
+                Layout.preferredHeight: 44
                 iconName: "download"
                 tipText: "Export"
                 enabled: backend.duration > 0 && !backend.busy
                 onClicked: exportVideo()
+            }
+        }
+
+        // --- subtitles ---
+        // Indented by a button's width on each side, so the lane lines up with
+        // the filmstrip it is timed against.
+        ColumnLayout {
+            visible: win.hasVideo && win.captionMode && backend.duration > 0
+            Layout.fillWidth: true
+            spacing: 8
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+
+                Item { Layout.preferredWidth: 44 }
+
+                CaptionTrack {
+                    id: captionTrack
+                    objectName: "captionTrack"
+                    Layout.fillWidth: true
+                    captions: captionModel
+                    durationSec: backend.duration
+                    windowStart: trimBar.windowStart
+                    windowEnd: trimBar.windowEnd
+                    trackX: trimBar.trackX
+                    trackW: trimBar.trackW
+                    playheadSec: trimBar.playheadSec
+                    selectedIndex: win.selectedCaption
+                    accent: win.accent
+                    accentForeground: win.accentForeground
+                    onPicked: (index) => {
+                        win.selectCaption(index);
+                        if (index >= 0)
+                            win.movePlayheadTo(captionModel.get(index).startSec);
+                    }
+                    onRetimed: (index, start, end) => win.retimeCaption(index, start, end)
+                    onAddRequested: (seconds) => win.addCaptionAt(seconds)
+                }
+
+                Item { Layout.preferredWidth: 44 }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+
+                Item { Layout.preferredWidth: 44 }
+
+                DialogButton {
+                    text: "+ Caption"
+                    primary: true
+                    onClicked: win.addCaption()
+                }
+
+                TextField {
+                    id: captionField
+                    objectName: "captionField"
+                    Layout.fillWidth: true
+                    enabled: win.selectedCaption >= 0
+                    placeholderText: win.selectedCaption >= 0
+                        ? "Caption text"
+                        : "Add a caption, or pick one on the lane"
+                    font.pixelSize: 14
+                    color: "white"
+                    selectByMouse: true
+                    // onTextEdited, not onTextChanged: selecting another caption
+                    // refills the field, and that must not write it back.
+                    onTextEdited: win.setCaptionText(text)
+                    Keys.onReturnPressed: focus = false
+                    Keys.onEnterPressed: focus = false
+                }
+
+                DialogButton {
+                    text: "Style"
+                    onClicked: win.styleVisible = true
+                }
+
+                IconButton {
+                    Layout.preferredWidth: 38
+                    Layout.preferredHeight: 38
+                    iconName: "trash"
+                    tipText: "Delete this caption (Del)"
+                    enabled: win.selectedCaption >= 0
+                    onClicked: win.deleteCaption()
+                }
+
+                Item { Layout.preferredWidth: 44 }
             }
         }
 
@@ -577,6 +952,9 @@ ApplicationWindow {
                 textFormat: Text.StyledText
                 text: Format.fmt(trimBar.playheadSec) + " (" + Format.fmt(trimBar.endSec - trimBar.startSec) + ")"
                     + (trimBar.zoomed ? " · <font color=\"" + win.accent + "\">zoomed</font>" : "")
+                    + (win.hasCaptions ? " · <font color=\"" + win.accent + "\">"
+                        + captionModel.count + (captionModel.count === 1 ? " caption" : " captions")
+                        + "</font>" : "")
                 color: "#d6d6da"
                 font.pixelSize: 13
                 font.family: "monospace"
@@ -608,6 +986,17 @@ ApplicationWindow {
         TapHandler {
             onTapped: win.helpVisible = !win.helpVisible
         }
+    }
+
+    // --- caption style ---
+    CaptionStylePanel {
+        visible: win.styleVisible
+        target: captionStyle
+        accent: win.accent
+        accentForeground: win.accentForeground
+        videoPixelHeight: backend.videoHeight > 0 ? backend.videoHeight : 1080
+        onChanged: win.syncCaptions()
+        onClosed: win.styleVisible = false
     }
 
     // --- hotkey overlay ---
@@ -650,6 +1039,10 @@ ApplicationWindow {
                         { keys: "Ctrl Space", action: "Trim start to playhead" },
                         { keys: "Alt Space", action: "Trim end to playhead" },
                         { keys: "Z", action: "Zoom the selection" },
+                        { keys: "C", action: "Subtitle editor" },
+                        { keys: "T", action: "Add a caption at the playhead" },
+                        { keys: "[ / ]", action: "Caption start / end to playhead" },
+                        { keys: "Del", action: "Delete the caption" },
                         { keys: "Ctrl O", action: "Open a video" },
                         { keys: "Ctrl S", action: "Export" },
                         { keys: "Q", action: "Quit" },
@@ -708,14 +1101,15 @@ ApplicationWindow {
                 spacing: 8
 
                 Label {
-                    text: "Unexported trim"
+                    text: win.hasCaptions ? "Unexported changes" : "Unexported trim"
                     color: "white"
                     font.pixelSize: 16
                     font.weight: Font.DemiBold
                 }
 
                 Label {
-                    text: "Your trim hasn't been exported. Quit anyway?"
+                    text: (win.hasCaptions ? "Your captions haven't been exported."
+                                           : "Your trim hasn't been exported.") + " Quit anyway?"
                     color: "#d6d6da"
                     font.pixelSize: 13
                     bottomPadding: 12
@@ -777,10 +1171,20 @@ ApplicationWindow {
             trimBar.playheadSec = 0;
             win.exportedStartSec = -1;
             win.exportedEndSec = -1;
+            // Captions belong to the video that was open, and their default
+            // size follows the new one's height.
+            captionModel.clear();
+            win.selectCaption(-1);
+            win.styleVisible = false;
+            win.resetCaptionStyle();
+            win.syncCaptions();
+            win.captionRevision = 0;
+            win.exportedCaptionRevision = 0;
         }
         function onExportDone(path) {
             win.exportedStartSec = win.pendingExportStartSec;
             win.exportedEndSec = win.pendingExportEndSec;
+            win.exportedCaptionRevision = win.pendingCaptionRevision;
             win.showNotice("Saved " + path);
         }
         function onExportFailed(message) {

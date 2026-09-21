@@ -16,6 +16,7 @@
 
 #include "backend.h"
 #include "filepicker.h"
+#include "subtitles.h"
 #include "thumbprovider.h"
 #include "thumbworker.h"
 
@@ -64,6 +65,8 @@ class ShortcutBackend : public QObject {
     Q_OBJECT
     Q_PROPERTY(QUrl source READ source NOTIFY infoChanged)
     Q_PROPERTY(double duration READ duration NOTIFY infoChanged)
+    Q_PROPERTY(int videoWidth READ videoWidth NOTIFY infoChanged)
+    Q_PROPERTY(int videoHeight READ videoHeight NOTIFY infoChanged)
     Q_PROPERTY(int thumbCount READ thumbCount NOTIFY thumbsChanged)
     Q_PROPERTY(int thumbReadyCount READ thumbReadyCount NOTIFY thumbsChanged)
     Q_PROPERTY(int thumbRevision READ thumbRevision NOTIFY thumbsChanged)
@@ -78,6 +81,8 @@ public:
 
     QUrl source() const { return m_source; }
     double duration() const { return m_duration; }
+    int videoWidth() const { return 720; }
+    int videoHeight() const { return 1280; }
     int thumbCount() const { return 0; }
     int thumbReadyCount() const { return 0; }
     int thumbRevision() const { return 0; }
@@ -95,6 +100,11 @@ public:
     }
     Q_INVOKABLE QUrl suggestedExportUrl() const { return {}; }
     Q_INVOKABLE void exportClip(const QUrl &, double, double) {}
+    Q_INVOKABLE void setCaptions(const QVariantList &cues, const QVariantMap &style) {
+        ++captionSyncCount;
+        lastCues = cues;
+        lastCaptionStyle = style;
+    }
     Q_INVOKABLE void requestThumbs(double start, double end) {
         ++thumbRequestCount;
         lastThumbStart = start;
@@ -111,6 +121,9 @@ public:
     int thumbRequestCount = 0;
     double lastThumbStart = 0;
     double lastThumbEnd = 0;
+    int captionSyncCount = 0;
+    QVariantList lastCues;
+    QVariantMap lastCaptionStyle;
 
 signals:
     void infoChanged();
@@ -194,14 +207,22 @@ private slots:
     void qmlSpaceChordsSetTheTrimEdges();
     void qmlZoomFocusesTheSelection();
     void qmlQuitConfirmsUnexportedTrim();
+    void captionAssCarriesTheStyleAndRebasesTheClip();
+    void captionAssEscapesTheAssMarkers();
+    void exportClipBurnsCaptionsIn();
+    void qmlCaptionEditorAddsRetimesAndTypes();
+    void qmlCaptionsCountAsUnexportedWork();
     void trimArgsReencodeForPreciseCuts();
     void trimArgsScaleTheShorterSide();
+    void trimArgsBurnCaptionsAfterTheDownscale();
     void exportHeightsNeverUpscale();
     void themeAccentReadsOmarchyColors();
     void themeAccentForegroundKeepsContrast();
 
 private:
     QUrl videoUrl() const { return QUrl::fromLocalFile(m_videoPath); }
+    QString makeSolidVideo(const QString &name, const QString &size) const;
+    QUrl exportedWith(Backend &backend, const QVariantList &cues, const QString &name);
     QString formatName(const QString &path) const;
     void waitForBackgroundWork(Backend &backend);
     bool installBrokenFfmpeg(const QString &dirPath);
@@ -853,6 +874,292 @@ void BackendTests::qmlQuitConfirmsUnexportedTrim() {
     QCOMPARE(quitSpy.count(), 1);
 }
 
+QString BackendTests::makeSolidVideo(const QString &name, const QString &size) const {
+    const QString path = m_dir.filePath(name);
+    QProcess proc;
+    proc.start(QStandardPaths::findExecutable(QStringLiteral("ffmpeg")), {
+        QStringLiteral("-hide_banner"), QStringLiteral("-loglevel"), QStringLiteral("error"),
+        QStringLiteral("-y"),
+        QStringLiteral("-f"), QStringLiteral("lavfi"),
+        QStringLiteral("-i"), QStringLiteral("color=c=black:size=%1:rate=10:duration=1").arg(size),
+        QStringLiteral("-c:v"), QStringLiteral("libx264"),
+        QStringLiteral("-pix_fmt"), QStringLiteral("yuv420p"),
+        path,
+    });
+    proc.waitForFinished(30000);
+    return path;
+}
+
+void BackendTests::captionAssCarriesTheStyleAndRebasesTheClip() {
+    const QList<subtitles::Cue> cues = {
+        {0.5, 1.5, QStringLiteral("before the clip")},
+        {3.0, 5.0, QStringLiteral("inside")},
+        {1.0, 7.0, QStringLiteral("spans the whole clip")},
+        {4.0, 4.5, QStringLiteral("   ")},  // never typed into: not a caption
+        {9.0, 9.5, QStringLiteral("after the clip")},
+    };
+
+    subtitles::Style style;
+    style.fontFamily = QStringLiteral("Test Sans");
+    style.fontSize = 48;
+    style.bold = true;
+    style.textColor = QStringLiteral("#ff0000");
+    style.outlineColor = QStringLiteral("#0000ff");
+    style.outlineWidth = 3;
+    style.marginV = 60;
+
+    const QString ass = subtitles::buildAss(cues, style, 1080, 1920, 2.0, 6.0);
+
+    // PlayRes is the video's own size, so the sizes above are in its pixels.
+    QVERIFY(ass.contains(QStringLiteral("PlayResX: 1080")));
+    QVERIFY(ass.contains(QStringLiteral("PlayResY: 1920")));
+
+    // ASS colours are &HAABBGGRR, so red reads as 0000FF and blue as FF0000.
+    QVERIFY2(ass.contains(QStringLiteral("Style: omacut,Test Sans,48,&H000000FF,&H000000FF,"
+                                         "&H00FF0000,&H00FF0000,-1,0,0,0,100,100,0,0,"
+                                         "1,3.0,0,2,65,65,60,1")),
+             qPrintable(ass));
+
+    // Only what shows up in [2, 6] survives, rebased so the clip starts at zero
+    // and clamped to its bounds.
+    QCOMPARE(ass.count(QStringLiteral("Dialogue:")), 2);
+    QVERIFY(ass.contains(QStringLiteral("Dialogue: 0,0:00:01.00,0:00:03.00,omacut,,0,0,0,,inside")));
+    QVERIFY(ass.contains(QStringLiteral("Dialogue: 0,0:00:00.00,0:00:04.00,omacut,,0,0,0,,"
+                                        "spans the whole clip")));
+
+    // The box replaces the outline, and its opacity inverts into ASS's alpha.
+    style.box = true;
+    style.boxColor = QStringLiteral("#000000");
+    style.boxOpacity = 60;
+    const QString boxed = subtitles::buildAss(cues, style, 1080, 1920, 2.0, 6.0);
+    QVERIFY2(boxed.contains(QStringLiteral(",&H66000000,&H66000000,-1,0,0,0,100,100,0,0,3,")),
+             qPrintable(boxed));
+
+    // Timestamps round to centiseconds without rolling over into 60 seconds.
+    QCOMPARE(subtitles::assTime(59.999), QStringLiteral("0:01:00.00"));
+    QCOMPARE(subtitles::assTime(-1.0), QStringLiteral("0:00:00.00"));
+    QCOMPARE(subtitles::assColor(QStringLiteral("#ffffff")), QStringLiteral("&H00FFFFFF"));
+}
+
+void BackendTests::captionAssEscapesTheAssMarkers() {
+    const QList<subtitles::Cue> cues = {
+        {0.0, 1.0, QStringLiteral("{an override} \\ and\ntwo lines")},
+    };
+    const QString ass = subtitles::buildAss(cues, subtitles::Style(), 640, 360, 0.0, 1.0);
+
+    // Braces would start an override block and a bare newline would end the
+    // event line, so both are escaped into something libass draws as typed.
+    QVERIFY2(ass.contains(QStringLiteral(",,\\{an override\\} \\\\ and\\Ntwo lines")),
+             qPrintable(ass));
+    QCOMPARE(ass.count(QStringLiteral("Dialogue:")), 1);
+}
+
+void BackendTests::exportClipBurnsCaptionsIn() {
+    ThumbProvider provider;
+    auto *picker = new FakeFilePicker;
+    Backend backend(&provider, picker);
+
+    const QString source = makeSolidVideo(QStringLiteral("caption-source.mp4"),
+                                          QStringLiteral("160x120"));
+    QVERIFY(ffmpeg::probe(source).ok);
+    QVERIFY(backend.load(QUrl::fromLocalFile(source)));
+    waitForBackgroundWork(backend);
+
+    const QVariantMap style{
+        {QStringLiteral("fontFamily"), QStringLiteral("Liberation Sans")},
+        {QStringLiteral("fontSize"), 24},
+        {QStringLiteral("bold"), true},
+        {QStringLiteral("textColor"), QStringLiteral("#ffffff")},
+        {QStringLiteral("outlineColor"), QStringLiteral("#000000")},
+        {QStringLiteral("outlineWidth"), 2},
+        {QStringLiteral("marginV"), 10},
+    };
+    const auto cue = [](double start, double end, const QString &text) {
+        return QVariant(QVariantMap{{QStringLiteral("start"), start},
+                                    {QStringLiteral("end"), end},
+                                    {QStringLiteral("text"), text}});
+    };
+
+    auto exportTo = [&](const QString &name) {
+        QSignalSpy doneSpy(&backend, &Backend::exportDone);
+        QSignalSpy failedSpy(&backend, &Backend::exportFailed);
+        backend.exportClip(QUrl::fromLocalFile(m_dir.filePath(name)), 0.0, 1.0);
+        QTRY_VERIFY_WITH_TIMEOUT(doneSpy.count() + failedSpy.count() > 0, 30000);
+        QVERIFY2(failedSpy.count() == 0,
+                 failedSpy.isEmpty() ? "" : qPrintable(failedSpy.first().at(0).toString()));
+    };
+
+    backend.setCaptions({}, style);
+    QVERIFY(!backend.hasCaptionsIn(0.0, 1.0));
+    exportTo(QStringLiteral("no-captions.mp4"));
+
+    // Captions outside the exported range, and ones never typed into, are not
+    // captions as far as the export is concerned.
+    backend.setCaptions({cue(5.0, 6.0, QStringLiteral("later"))}, style);
+    QVERIFY(!backend.hasCaptionsIn(0.0, 1.0));
+    backend.setCaptions({cue(0.0, 1.0, QStringLiteral("  "))}, style);
+    QVERIFY(!backend.hasCaptionsIn(0.0, 1.0));
+
+    backend.setCaptions({cue(0.0, 1.0, QStringLiteral("burned in"))}, style);
+    QVERIFY(backend.hasCaptionsIn(0.0, 1.0));
+    exportTo(QStringLiteral("with-captions.mp4"));
+
+    const QString plain = m_dir.filePath(QStringLiteral("no-captions.mp4"));
+    const QString burned = m_dir.filePath(QStringLiteral("with-captions.mp4"));
+    QVERIFY(ffmpeg::probe(burned).ok);
+    // White text over a black frame is a lot of new detail; an export that
+    // didn't burn anything in would be the same size as the plain one.
+    QVERIFY2(QFileInfo(burned).size() > QFileInfo(plain).size(),
+             qPrintable(QStringLiteral("plain %1 vs burned %2")
+                            .arg(QFileInfo(plain).size())
+                            .arg(QFileInfo(burned).size())));
+
+    // The .ass is a temp file that only lives as long as the encode.
+    const QStringList leftovers = QDir(QDir::tempPath())
+        .entryList({QStringLiteral("omacut-captions-*.ass")}, QDir::Files);
+    QVERIFY2(leftovers.isEmpty(), qPrintable(leftovers.join(QStringLiteral(", "))));
+}
+
+void BackendTests::qmlCaptionEditorAddsRetimesAndTypes() {
+    ShortcutBackend backend(QUrl::fromLocalFile(m_dir.filePath(QStringLiteral("shortcut-placeholder.mp4"))),
+                            20.0);
+    QmlHarness harness(backend);
+
+    QVERIFY2(harness.window(), qPrintable(mainQmlPath()));
+    QQuickWindow *window = harness.window();
+    QTRY_VERIFY_WITH_TIMEOUT(window->property("audioOutputReady").toBool(), 3000);
+
+    backend.announceInfo();
+    QQuickItem *trimBar = harness.trimBar();
+    QVERIFY(trimBar);
+
+    window->show();
+    window->requestActivate();
+    QTest::qWait(100);
+
+    // C opens the subtitle editor.
+    QTest::keyClick(window, Qt::Key_C);
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("captionMode").toBool(), true, 3000);
+
+    // T drops a two-second caption at the playhead and selects it.
+    QTest::keyClick(window, Qt::Key_Right, Qt::ShiftModifier);
+    QTRY_COMPARE_WITH_TIMEOUT(trimBar->property("playheadSec").toDouble(), 5.0, 3000);
+    QTest::keyClick(window, Qt::Key_T);
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("selectedCaption").toInt(), 0, 3000);
+    QCOMPARE(backend.lastCues.size(), 1);
+    QCOMPARE(backend.lastCues.first().toMap().value(QStringLiteral("start")).toDouble(), 5.0);
+    QCOMPARE(backend.lastCues.first().toMap().value(QStringLiteral("end")).toDouble(), 7.0);
+
+    // The new caption takes the keyboard, so the shortcuts stop swallowing keys:
+    // this types a caption instead of zooming, playing and quitting.
+    QTRY_VERIFY_WITH_TIMEOUT(window->property("typing").toBool(), 3000);
+    const QString typed = QStringLiteral("zoom q me");
+    for (const QChar ch : typed)
+        QTest::keyClick(window, ch.toLatin1());
+    QTRY_COMPARE_WITH_TIMEOUT(backend.lastCues.first().toMap().value(QStringLiteral("text")).toString(),
+                              typed, 3000);
+    QCOMPARE(trimBar->property("zoomed").toBool(), false);
+    QCOMPARE(window->property("quitConfirmVisible").toBool(), false);
+    QCOMPARE(window->property("activeCaptionText").toString(), typed);
+
+    // Escape hands the keyboard back, and Z zooms again.
+    QTest::keyClick(window, Qt::Key_Escape);
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("typing").toBool(), false, 3000);
+    QTest::keyClick(window, Qt::Key_Z);
+    QTRY_COMPARE_WITH_TIMEOUT(trimBar->property("zoomed").toBool(), true, 3000);
+
+    // ] pulls the caption's end to the playhead, [ its start.
+    QTest::keyClick(window, Qt::Key_Right);
+    QTRY_COMPARE_WITH_TIMEOUT(trimBar->property("playheadSec").toDouble(), 6.0, 3000);
+    QTest::keyClick(window, Qt::Key_BracketRight);
+    QTRY_COMPARE_WITH_TIMEOUT(backend.lastCues.first().toMap().value(QStringLiteral("end")).toDouble(),
+                              6.0, 3000);
+    QTest::keyClick(window, Qt::Key_Left);
+    QTRY_COMPARE_WITH_TIMEOUT(trimBar->property("playheadSec").toDouble(), 5.0, 3000);
+    QTest::keyClick(window, Qt::Key_BracketLeft);
+    QTRY_COMPARE_WITH_TIMEOUT(backend.lastCues.first().toMap().value(QStringLiteral("start")).toDouble(),
+                              5.0, 3000);
+
+    // Dragging the block's middle slides the whole caption along the lane.
+    QQuickItem *captionTrack = window->findChild<QQuickItem *>(QStringLiteral("captionTrack"));
+    QVERIFY(captionTrack);
+    const double windowStart = captionTrack->property("windowStart").toDouble();
+    const double windowLen = captionTrack->property("windowEnd").toDouble() - windowStart;
+    const double trackX = captionTrack->property("trackX").toDouble();
+    const double trackW = captionTrack->property("trackW").toDouble();
+    QVERIFY(windowLen > 0 && trackW > 0);
+    const auto pointAt = [&](double seconds) {
+        return captionTrack
+            ->mapToScene(QPointF(trackX + (seconds - windowStart) / windowLen * trackW,
+                                 captionTrack->height() / 2))
+            .toPoint();
+    };
+    const auto cueStart = [&backend] {
+        return backend.lastCues.first().toMap().value(QStringLiteral("start")).toDouble();
+    };
+
+    QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, pointAt(5.5));
+    QTest::mouseMove(window, pointAt(6.5));
+    QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, pointAt(6.5));
+    // A pixel of slack: the drag lands on whole pixels, not whole seconds.
+    QTRY_VERIFY_WITH_TIMEOUT(qAbs(cueStart() - 6.0) < 0.1, 3000);
+    QVERIFY(qAbs(backend.lastCues.first().toMap().value(QStringLiteral("end")).toDouble() - 7.0) < 0.1);
+
+    // Delete removes it, and the backend is told the list is empty again.
+    QTest::keyClick(window, Qt::Key_Delete);
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("selectedCaption").toInt(), -1, 3000);
+    QCOMPARE(backend.lastCues.size(), 0);
+}
+
+void BackendTests::qmlCaptionsCountAsUnexportedWork() {
+    ShortcutBackend backend(QUrl::fromLocalFile(m_dir.filePath(QStringLiteral("shortcut-placeholder.mp4"))),
+                            20.0);
+    QmlHarness harness(backend);
+
+    QVERIFY2(harness.window(), qPrintable(mainQmlPath()));
+    QQuickWindow *window = harness.window();
+    QTRY_VERIFY_WITH_TIMEOUT(window->property("audioOutputReady").toBool(), 3000);
+
+    backend.announceInfo();
+    window->show();
+    window->requestActivate();
+    QTest::qWait(100);
+
+    // An untouched video is clean even though the trim spans all of it.
+    QCOMPARE(window->property("trimDirty").toBool(), false);
+
+    // A caption is unexported work, exactly like a trim.
+    QTest::keyClick(window, Qt::Key_T);
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("trimDirty").toBool(), true, 3000);
+    QTest::keyClick(window, Qt::Key_Escape);
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("typing").toBool(), false, 3000);
+
+    QTest::keyClick(window, Qt::Key_S, Qt::ControlModifier);
+    QTRY_COMPARE_WITH_TIMEOUT(backend.exportCount, 1, 3000);
+    backend.announceExportDone();
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("trimDirty").toBool(), false, 3000);
+
+    // Another caption after that export is unexported work again.
+    QTest::keyClick(window, Qt::Key_Right, Qt::ShiftModifier);
+    QTest::keyClick(window, Qt::Key_T);
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("trimDirty").toBool(), true, 3000);
+    QTest::keyClick(window, Qt::Key_Escape);
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("typing").toBool(), false, 3000);
+
+    // Deleting them all leaves nothing worth exporting, just like an untouched
+    // trim, so the prompt stays out of the way.
+    QTest::keyClick(window, Qt::Key_Delete);
+    QCOMPARE(window->property("trimDirty").toBool(), true);
+    QTest::keyClick(window, Qt::Key_Delete);
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("hasCaptions").toBool(), false, 3000);
+    QCOMPARE(window->property("trimDirty").toBool(), false);
+
+    // Opening another video starts from a clean slate.
+    backend.announceInfo();
+    QTRY_COMPARE_WITH_TIMEOUT(window->property("trimDirty").toBool(), false, 3000);
+    QCOMPARE(window->property("hasCaptions").toBool(), false);
+}
+
 void BackendTests::trimArgsReencodeForPreciseCuts() {
     const QStringList args = ffmpeg::trimArgs(QStringLiteral("in.mp4"),
                                               QStringLiteral("out.mp4"),
@@ -882,6 +1189,34 @@ void BackendTests::trimArgsScaleTheShorterSide() {
     QVERIFY(vfAt >= 0);
     QCOMPARE(args.value(vfAt + 1),
              QStringLiteral("scale='if(gt(iw,ih),-2,1080)':'if(gt(iw,ih),1080,-2)'"));
+}
+
+void BackendTests::trimArgsBurnCaptionsAfterTheDownscale() {
+    const QStringList args = ffmpeg::trimArgs(QStringLiteral("in.mp4"), QStringLiteral("out.mp4"),
+                                              0.0, 1.0, 720,
+                                              QStringLiteral("/tmp/odd dir/caps:1.ass"));
+    const int filterAt = args.indexOf(QStringLiteral("-vf"));
+    QVERIFY(filterAt >= 0);
+    const QString filters = args.value(filterAt + 1);
+
+    // The downscale runs first, so libass draws the text at the export's own
+    // resolution instead of it being resampled along with the frame.
+    QVERIFY2(filters.startsWith(QStringLiteral("scale=")), qPrintable(filters));
+    QVERIFY2(filters.indexOf(QStringLiteral("scale=")) < filters.indexOf(QStringLiteral("subtitles=")),
+             qPrintable(filters));
+    // A colon in the path would otherwise split the filter's arguments.
+    QVERIFY2(filters.endsWith(QStringLiteral(",subtitles=filename=/tmp/odd dir/caps\\:1.ass")),
+             qPrintable(filters));
+
+    // No downscale: the subtitle filter stands alone.
+    const QStringList plain = ffmpeg::trimArgs(QStringLiteral("in.mp4"), QStringLiteral("out.mp4"),
+                                               0.0, 1.0, 0, QStringLiteral("/tmp/caps.ass"));
+    QCOMPARE(plain.value(plain.indexOf(QStringLiteral("-vf")) + 1),
+             QStringLiteral("subtitles=filename=/tmp/caps.ass"));
+
+    // And no captions at all leaves the argument list exactly as it was.
+    QVERIFY(!ffmpeg::trimArgs(QStringLiteral("in.mp4"), QStringLiteral("out.mp4"), 0.0, 1.0)
+                 .contains(QStringLiteral("-vf")));
 }
 
 void BackendTests::exportHeightsNeverUpscale() {

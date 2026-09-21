@@ -2,6 +2,9 @@
     <qresource prefix="/">
         <file alias="Main.qml">Main.qml</file>
         <file alias="TrimBar.qml">TrimBar.qml</file>
+        <file alias="CaptionTrack.qml">CaptionTrack.qml</file>
+        <file alias="CaptionOverlay.qml">CaptionOverlay.qml</file>
+        <file alias="CaptionStylePanel.qml">CaptionStylePanel.qml</file>
         <file alias="Format.js">Format.js</file>
     </qresource>
 </RCC>

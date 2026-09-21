@@ -4,11 +4,16 @@
 #include <QImage>
 #include <QObject>
 #include <QString>
+#include <QTemporaryFile>
 #include <QTimer>
 #include <QUrl>
+
 #include <QVector>
 
+#include <memory>
+
 #include "ffmpeg.h"
+#include "subtitles.h"
 
 class ThumbProvider;
 class FilePicker;
@@ -20,6 +25,8 @@ class Backend : public QObject {
     Q_OBJECT
     Q_PROPERTY(QUrl source READ source NOTIFY infoChanged)
     Q_PROPERTY(double duration READ duration NOTIFY infoChanged)
+    Q_PROPERTY(int videoWidth READ videoWidth NOTIFY infoChanged)
+    Q_PROPERTY(int videoHeight READ videoHeight NOTIFY infoChanged)
     Q_PROPERTY(int thumbCount READ thumbCount NOTIFY thumbsChanged)
     Q_PROPERTY(int thumbReadyCount READ thumbReadyCount NOTIFY thumbsChanged)
     Q_PROPERTY(int thumbRevision READ thumbRevision NOTIFY thumbsChanged)
@@ -36,6 +43,9 @@ public:
 
     QUrl source() const { return m_source; }
     double duration() const { return m_info.duration; }
+    // The displayed size, so QML lays captions out over the frame it shows.
+    int videoWidth() const { return m_info.displayWidth; }
+    int videoHeight() const { return m_info.displayHeight; }
     int thumbCount() const { return m_thumbCount; }
     int thumbReadyCount() const { return m_thumbReadyCount; }
     int thumbRevision() const { return m_thumbRevision; }
@@ -62,9 +72,19 @@ public:
     Q_INVOKABLE QUrl suggestedExportUrl() const;
 
     // Write [start, end] (seconds) of the loaded video to dst. A non-zero
-    // scaleHeight downscales the shorter side to that size.
+    // scaleHeight downscales the shorter side to that size. Any captions set
+    // with setCaptions() that fall inside the range are burned in.
     Q_INVOKABLE void exportClip(const QUrl &dst, double start, double end,
                                 int scaleHeight = 0);
+
+    // The captions to burn in, pushed from the editor whenever they change:
+    // cues are [{start, end, text}] in source-video seconds, style is the one
+    // look they all share (see subtitles::Style).
+    Q_INVOKABLE void setCaptions(const QVariantList &cues, const QVariantMap &style);
+
+    // Whether any caption would actually show up in [start, end] — what the UI
+    // uses to tell "burning captions in" apart from a plain trim.
+    Q_INVOKABLE bool hasCaptionsIn(double start, double end) const;
 
     // The downscale heights worth offering for a source: only ones strictly
     // below the source's shorter side, so exports never upscale.
@@ -86,6 +106,10 @@ signals:
 
 private:
     void setBusy(bool busy);
+    // The .ass file for the captions inside [start, end], or nullptr when none
+    // of them show up there. It stays alive — and on disk — only as long as the
+    // returned handle does.
+    std::unique_ptr<QTemporaryFile> writeCaptionFile(double start, double end);
     void setStatus(const QString &status);
     void failExport(const QString &tmpPath, const QString &message);
     void startThumbs();
@@ -99,6 +123,8 @@ private:
     FilePicker *m_filePicker;
     ThumbWorker *m_thumbWorker = nullptr;
     ffmpeg::VideoInfo m_info;
+    QList<subtitles::Cue> m_cues;
+    subtitles::Style m_captionStyle;
     QString m_path;
     QUrl m_source;
     double m_thumbStart = 0.0;

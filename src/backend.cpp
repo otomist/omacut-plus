@@ -5,6 +5,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QProcess>
+#include <QTemporaryFile>
 #include <QTextStream>
 
 #include <cstdio>
@@ -12,6 +13,7 @@
 
 #include "filepicker.h"
 #include "portalfilepicker.h"
+#include "subtitles.h"
 #include "thumbprovider.h"
 #include "thumbworker.h"
 
@@ -314,6 +316,39 @@ QUrl Backend::suggestedExportUrl() const {
     return QUrl::fromLocalFile(target);
 }
 
+void Backend::setCaptions(const QVariantList &cues, const QVariantMap &style) {
+    m_cues = subtitles::cuesFromVariant(cues);
+    m_captionStyle = subtitles::styleFromVariant(style);
+}
+
+bool Backend::hasCaptionsIn(double start, double end) const {
+    return !subtitles::cuesForClip(m_cues, start, end).isEmpty();
+}
+
+std::unique_ptr<QTemporaryFile> Backend::writeCaptionFile(double start, double end) {
+    if (!hasCaptionsIn(start, end))
+        return nullptr;
+
+    // A plain name in the temp dir, so the path stays easy on the filtergraph
+    // parser no matter what the export is called.
+    auto file = std::make_unique<QTemporaryFile>(
+        QDir::tempPath() + QStringLiteral("/omacut-captions-XXXXXX.ass"));
+    if (!file->open())
+        return nullptr;
+
+    const QString document = subtitles::buildAss(m_cues, m_captionStyle,
+                                                 m_info.displayWidth, m_info.displayHeight,
+                                                 start, end);
+    QTextStream out(file.get());
+    out.setEncoding(QStringConverter::Utf8);
+    out << document;
+    out.flush();
+    file->flush();
+    if (file->error() != QFileDevice::NoError)
+        return nullptr;
+    return file;
+}
+
 void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHeight) {
     if (m_path.isEmpty() || !m_info.ok || m_busy)
         return;
@@ -340,6 +375,16 @@ void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHei
         return;
     }
 
+    // Captions are burned in from an .ass file that lives exactly as long as
+    // the encode does; keeping the handle in the callbacks deletes it on every
+    // way out, including a failure to start.
+    const bool burnsCaptions = hasCaptionsIn(start, end);
+    std::shared_ptr<QTemporaryFile> captionFile = writeCaptionFile(start, end);
+    if (burnsCaptions && !captionFile) {
+        emit exportFailed(QStringLiteral("Could not write the captions for this export."));
+        return;
+    }
+
     setBusy(true);
     setStatus(QStringLiteral("Exporting 0%"));
 
@@ -347,7 +392,8 @@ void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHei
     // success, so failed/cancelled exports preserve any existing file.
     const QString tmpPath = outPath + QStringLiteral(".omacut-part.mp4");
     QFile::remove(tmpPath);
-    const QStringList args = ffmpeg::trimArgs(m_path, tmpPath, start, end, scaleHeight);
+    const QStringList args = ffmpeg::trimArgs(m_path, tmpPath, start, end, scaleHeight,
+                                              captionFile ? captionFile->fileName() : QString());
 
     auto *proc = new QProcess(this);
     auto completed = std::make_shared<bool>(false);
@@ -375,7 +421,7 @@ void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHei
             });
 
     connect(proc, &QProcess::finished, this,
-            [this, proc, outPath, tmpPath, completed](int code, QProcess::ExitStatus exitStatus) {
+            [this, proc, outPath, tmpPath, completed, captionFile](int code, QProcess::ExitStatus exitStatus) {
                 if (*completed)
                     return;
                 *completed = true;
@@ -394,7 +440,7 @@ void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHei
                 emit exportDone(outPath);
             });
     connect(proc, &QProcess::errorOccurred, this,
-            [this, proc, tmpPath, completed](QProcess::ProcessError error) {
+            [this, proc, tmpPath, completed, captionFile](QProcess::ProcessError error) {
                 if (error != QProcess::FailedToStart || *completed)
                     return;
                 *completed = true;
