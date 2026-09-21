@@ -30,16 +30,18 @@ public:
     double lastStart = 0;
     double lastEnd = 0;
     QList<int> lastScaleHeights;
+    bool lastOfferedSidecar = false;
 
     void openVideo() override { ++openCount; }
 
     void exportVideo(const QUrl &suggestedUrl, double start, double end,
-                     const QList<int> &scaleHeights) override {
+                     const QList<int> &scaleHeights, bool offerSidecar) override {
         ++exportCount;
         lastSuggestedUrl = suggestedUrl;
         lastStart = start;
         lastEnd = end;
         lastScaleHeights = scaleHeights;
+        lastOfferedSidecar = offerSidecar;
     }
 };
 
@@ -99,7 +101,7 @@ public:
         lastEnd = end;
     }
     Q_INVOKABLE QUrl suggestedExportUrl() const { return {}; }
-    Q_INVOKABLE void exportClip(const QUrl &, double, double) {}
+    Q_INVOKABLE void exportClip(const QUrl &, double, double, int, bool) {}
     Q_INVOKABLE void setCaptions(const QVariantList &cues, const QVariantMap &style) {
         ++captionSyncCount;
         lastCues = cues;
@@ -112,7 +114,9 @@ public:
     }
 
     void announceInfo() { emit infoChanged(); }
-    void announceExportDone() { emit exportDone(QStringLiteral("/tmp/exported.mp4")); }
+    void announceExportDone() {
+        emit exportDone(QStringLiteral("/tmp/exported.mp4"), QString());
+    }
 
     int openCount = 0;
     int exportCount = 0;
@@ -131,8 +135,9 @@ signals:
     void busyChanged();
     void statusChanged();
     void themeAccentChanged();
-    void exportDone(const QString &path);
+    void exportDone(const QString &path, const QString &sidecarPath);
     void exportFailed(const QString &message);
+    void exportWarning(const QString &message);
     void loadError(const QString &message);
 
 private:
@@ -210,6 +215,9 @@ private slots:
     void captionAssCarriesTheStyleAndRebasesTheClip();
     void captionAssEscapesTheAssMarkers();
     void exportClipBurnsCaptionsIn();
+    void srtSidecarNumbersAndRebasesTheCues();
+    void exportOffersTheSidecarOnlyWhenCaptionsAreInTheClip();
+    void exportClipWritesTheSrtSidecar();
     void qmlCaptionEditorAddsRetimesAndTypes();
     void qmlCaptionsCountAsUnexportedWork();
     void trimArgsReencodeForPreciseCuts();
@@ -1018,6 +1026,130 @@ void BackendTests::exportClipBurnsCaptionsIn() {
     const QStringList leftovers = QDir(QDir::tempPath())
         .entryList({QStringLiteral("omacut-captions-*.ass")}, QDir::Files);
     QVERIFY2(leftovers.isEmpty(), qPrintable(leftovers.join(QStringLiteral(", "))));
+}
+
+void BackendTests::srtSidecarNumbersAndRebasesTheCues() {
+    const QList<subtitles::Cue> cues = {
+        {0.5, 1.5, QStringLiteral("before the clip")},
+        {3.0, 4.25, QStringLiteral("first")},
+        {4.5, 4.75, QStringLiteral("  ")},  // never typed into: not a caption
+        {5.0, 9.0, QStringLiteral("second, clamped to the end")},
+        {9.5, 10.0, QStringLiteral("after the clip")},
+    };
+
+    // Same window as the burned-in captions get: rebased onto the clip, clamped
+    // to it, and numbered from one in playback order.
+    const QString srt = subtitles::buildSrt(cues, 2.0, 6.0);
+    QCOMPARE(srt, QStringLiteral("1\n00:00:01,000 --> 00:00:02,250\nfirst\n\n"
+                                 "2\n00:00:03,000 --> 00:00:04,000\n"
+                                 "second, clamped to the end\n\n"));
+
+    // Nothing in the clip means no file at all, not an empty one.
+    QVERIFY(subtitles::buildSrt(cues, 20.0, 30.0).isEmpty());
+    QVERIFY(subtitles::buildSrt({}, 0.0, 10.0).isEmpty());
+
+    // SubRip counts milliseconds after a comma, and pads the hours.
+    QCOMPARE(subtitles::srtTime(3661.5), QStringLiteral("01:01:01,500"));
+    QCOMPARE(subtitles::srtTime(-1.0), QStringLiteral("00:00:00,000"));
+}
+
+void BackendTests::exportOffersTheSidecarOnlyWhenCaptionsAreInTheClip() {
+    ThumbProvider provider;
+    auto *picker = new FakeFilePicker;
+    Backend backend(&provider, picker);
+
+    QVERIFY(backend.load(videoUrl()));
+    waitForBackgroundWork(backend);
+
+    const auto cue = [](double start, double end, const QString &text) {
+        return QVariant(QVariantMap{{QStringLiteral("start"), start},
+                                    {QStringLiteral("end"), end},
+                                    {QStringLiteral("text"), text}});
+    };
+
+    // No captions: the save dialog has nothing to ask about.
+    backend.exportDialog(0.0, 1.0);
+    QCOMPARE(picker->exportCount, 1);
+    QCOMPARE(picker->lastOfferedSidecar, false);
+
+    // Captions, but not in the exported stretch: still nothing to offer.
+    backend.setCaptions({cue(5.0, 6.0, QStringLiteral("later"))}, {});
+    backend.exportDialog(0.0, 1.0);
+    QCOMPARE(picker->lastOfferedSidecar, false);
+
+    backend.setCaptions({cue(0.2, 0.8, QStringLiteral("in shot"))}, {});
+    backend.exportDialog(0.0, 1.0);
+    QCOMPARE(picker->lastOfferedSidecar, true);
+}
+
+void BackendTests::exportClipWritesTheSrtSidecar() {
+    ThumbProvider provider;
+    auto *picker = new FakeFilePicker;
+    Backend backend(&provider, picker);
+
+    QVERIFY(backend.load(videoUrl()));
+    waitForBackgroundWork(backend);
+
+    const QVariantMap style{{QStringLiteral("fontFamily"), QStringLiteral("Liberation Sans")},
+                            {QStringLiteral("fontSize"), 24}};
+    backend.setCaptions({QVariant(QVariantMap{{QStringLiteral("start"), 0.2},
+                                              {QStringLiteral("end"), 0.8},
+                                              {QStringLiteral("text"), QStringLiteral("in shot")}})},
+                        style);
+
+    // The test macros can't live in a value-returning lambda, so the sidecar
+    // path exportDone reported comes back out here.
+    QString reportedSidecar;
+    const auto exportTo = [&](const QString &name, bool sidecar) {
+        QSignalSpy doneSpy(&backend, &Backend::exportDone);
+        QSignalSpy failedSpy(&backend, &Backend::exportFailed);
+        reportedSidecar.clear();
+        backend.exportClip(QUrl::fromLocalFile(m_dir.filePath(name)), 0.0, 1.0, 0, sidecar);
+        QTRY_VERIFY_WITH_TIMEOUT(doneSpy.count() + failedSpy.count() > 0, 30000);
+        QCOMPARE(failedSpy.count(), 0);
+        QCOMPARE(doneSpy.count(), 1);
+        reportedSidecar = doneSpy.first().at(1).toString();
+    };
+
+    // Asked for: the .srt lands next to the video, named after it, holding the
+    // captions rebased onto the exported clip.
+    exportTo(QStringLiteral("with-srt.mp4"), true);
+    const QString srtPath = reportedSidecar;
+    QCOMPARE(srtPath, m_dir.filePath(QStringLiteral("with-srt.srt")));
+    QFile srt(srtPath);
+    QVERIFY(srt.open(QIODevice::ReadOnly | QIODevice::Text));
+    QCOMPARE(QString::fromUtf8(srt.readAll()),
+             QStringLiteral("1\n00:00:00,200 --> 00:00:00,800\nin shot\n\n"));
+    srt.close();
+
+    // Not asked for: only the video is written, and exportDone says as much.
+    exportTo(QStringLiteral("no-srt.mp4"), false);
+    QCOMPARE(reportedSidecar, QString());
+    QVERIFY(!QFileInfo::exists(m_dir.filePath(QStringLiteral("no-srt.srt"))));
+
+    // A failed export leaves an .srt that was already sitting there alone.
+    const QString keptPath = m_dir.filePath(QStringLiteral("keep-srt.srt"));
+    const QByteArray original("someone else's subtitles");
+    {
+        QFile existing(keptPath);
+        QVERIFY(existing.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        existing.write(original);
+    }
+
+    QTemporaryDir pathDir;
+    QVERIFY(pathDir.isValid());
+    QVERIFY(installBrokenFfmpeg(pathDir.path()));
+    EnvVarGuard pathGuard("PATH");
+    qputenv("PATH", QFile::encodeName(pathDir.path()) + ':' + qgetenv("PATH"));
+
+    QSignalSpy failedSpy(&backend, &Backend::exportFailed);
+    backend.exportClip(QUrl::fromLocalFile(m_dir.filePath(QStringLiteral("keep-srt.mp4"))),
+                       0.0, 1.0, 0, true);
+    QTRY_COMPARE_WITH_TIMEOUT(failedSpy.count(), 1, 5000);
+
+    QFile kept(keptPath);
+    QVERIFY(kept.open(QIODevice::ReadOnly));
+    QCOMPARE(kept.readAll(), original);
 }
 
 void BackendTests::qmlCaptionEditorAddsRetimesAndTypes() {

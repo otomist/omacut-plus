@@ -56,4 +56,12 @@ QList<Cue> cuesForClip(const QList<Cue> &cues, double clipStart, double clipEnd)
 QString buildAss(const QList<Cue> &cues, const Style &style, int width, int height,
                  double clipStart, double clipEnd);
 
+// Seconds -> "HH:MM:SS,mmm", SubRip's timestamp format.
+QString srtTime(double seconds);
+
+// The .srt sidecar for a clip: the same cues buildAss() burns in, as text and
+// timings a player (or YouTube, or an editor) can read on its own. Empty when
+// no caption shows up in the clip.
+QString buildSrt(const QList<Cue> &cues, double clipStart, double clipEnd);
+
 }  // namespace subtitles

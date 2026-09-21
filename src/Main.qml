@@ -1181,11 +1181,15 @@ ApplicationWindow {
             win.captionRevision = 0;
             win.exportedCaptionRevision = 0;
         }
-        function onExportDone(path) {
+        function onExportDone(path, sidecarPath) {
             win.exportedStartSec = win.pendingExportStartSec;
             win.exportedEndSec = win.pendingExportEndSec;
             win.exportedCaptionRevision = win.pendingCaptionRevision;
-            win.showNotice("Saved " + path);
+            win.showNotice("Saved " + path
+                + (sidecarPath !== "" ? " + " + fileName(sidecarPath) : ""));
+        }
+        function onExportWarning(message) {
+            win.showNotice(message);
         }
         function onExportFailed(message) {
             win.showNotice("Export failed: " + message);

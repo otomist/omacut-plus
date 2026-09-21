@@ -73,9 +73,10 @@ public:
 
     // Write [start, end] (seconds) of the loaded video to dst. A non-zero
     // scaleHeight downscales the shorter side to that size. Any captions set
-    // with setCaptions() that fall inside the range are burned in.
+    // with setCaptions() that fall inside the range are burned in, and sidecar
+    // also writes them next to the video as an .srt.
     Q_INVOKABLE void exportClip(const QUrl &dst, double start, double end,
-                                int scaleHeight = 0);
+                                int scaleHeight = 0, bool sidecar = false);
 
     // The captions to burn in, pushed from the editor whenever they change:
     // cues are [{start, end, text}] in source-video seconds, style is the one
@@ -100,8 +101,10 @@ signals:
     void busyChanged();
     void statusChanged();
     void themeAccentChanged();
-    void exportDone(const QString &path);
+    void exportDone(const QString &path, const QString &sidecarPath);
     void exportFailed(const QString &message);
+    // The export itself went through, but something beside it didn't.
+    void exportWarning(const QString &message);
     void loadError(const QString &message);
 
 private:
@@ -110,6 +113,9 @@ private:
     // of them show up there. It stays alive — and on disk — only as long as the
     // returned handle does.
     std::unique_ptr<QTemporaryFile> writeCaptionFile(double start, double end);
+    // The .srt next to the exported video, or an empty string if it couldn't be
+    // written (which is reported, never silent).
+    QString writeSidecar(const QString &videoPath, const QString &document);
     void setStatus(const QString &status);
     void failExport(const QString &tmpPath, const QString &message);
     void startThumbs();

@@ -44,6 +44,15 @@ Captions are **burned into** the exported video (via ffmpeg and libass), so they
 the clip is played. The source file is never touched, and captions that fall outside the trim are
 left out of the export.
 
+When the clip has captions, the export dialog also offers a **Subtitles** choice:
+
+- *Burned in* — just the video.
+- *Burned in + .srt file* — also writes `<name>.srt` next to the video, holding each caption's text
+  and timing. The times are relative to the exported clip, so the file drops straight into a player,
+  YouTube or another editor.
+
+A failed export never touches an `.srt` that was already there.
+
 ## Install
 
 Install via the Omarchy Package Repository via the `omacut` package. It's installed by default in new installations of Omarchy (from Quattro forward).
@@ -53,7 +62,7 @@ Install via the Omarchy Package Repository via the `omacut` package. It's instal
 - `xdg-desktop-portal` and a portal backend for the file picker
 - `ffmpeg` and `ffprobe` on your PATH (used at runtime), with libass support for burning in captions
 
-Exports are always written as MP4 files, regardless of the input video's container. The export dialog offers Original/1080p/720p quality — never upscaling, and always preserving the aspect ratio.
+Exports are always written as MP4 files, regardless of the input video's container. The export dialog offers Original/1080p/720p quality — never upscaling, and always preserving the aspect ratio — and, for a clip with captions, whether to write an `.srt` beside it.
 
 ## Build
 

@@ -113,6 +113,40 @@ QList<Cue> cuesForClip(const QList<Cue> &cues, double clipStart, double clipEnd)
     return clipped;
 }
 
+QString srtTime(double seconds) {
+    if (!(seconds > 0.0) || std::isnan(seconds))
+        seconds = 0.0;
+    qint64 ms = qRound64(seconds * 1000.0);
+    const qint64 hours = ms / 3600000;
+    ms -= hours * 3600000;
+    const qint64 minutes = ms / 60000;
+    ms -= minutes * 60000;
+    const qint64 wholeSeconds = ms / 1000;
+    ms -= wholeSeconds * 1000;
+    return QStringLiteral("%1:%2:%3,%4")
+        .arg(hours, 2, 10, QLatin1Char('0'))
+        .arg(minutes, 2, 10, QLatin1Char('0'))
+        .arg(wholeSeconds, 2, 10, QLatin1Char('0'))
+        .arg(ms, 3, 10, QLatin1Char('0'));
+}
+
+QString buildSrt(const QList<Cue> &cues, double clipStart, double clipEnd) {
+    const QList<Cue> clipped = cuesForClip(cues, clipStart, clipEnd);
+    if (clipped.isEmpty())
+        return {};
+
+    QString out;
+    int index = 0;
+    for (const Cue &cue : clipped) {
+        // SubRip has no escaping: the text goes in as typed, and a blank line
+        // ends each entry.
+        out += QStringLiteral("%1\n%2 --> %3\n%4\n\n")
+                   .arg(++index)
+                   .arg(srtTime(cue.start), srtTime(cue.end), cue.text);
+    }
+    return out;
+}
+
 QString buildAss(const QList<Cue> &cues, const Style &style, int width, int height,
                  double clipStart, double clipEnd) {
     const int playResX = width > 0 ? width : kFallbackWidth;

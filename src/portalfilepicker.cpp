@@ -180,7 +180,7 @@ void PortalFilePicker::openVideo() {
 }
 
 void PortalFilePicker::exportVideo(const QUrl &suggestedUrl, double start, double end,
-                                   const QList<int> &scaleHeights) {
+                                   const QList<int> &scaleHeights, bool offerSidecar) {
     const QFileInfo target(suggestedUrl.toLocalFile());
 
     QVariantMap options;
@@ -193,16 +193,24 @@ void PortalFilePicker::exportVideo(const QUrl &suggestedUrl, double start, doubl
 
     // A "Quality" combo in the save dialog, only when there's a real downscale
     // to offer — sources at or below 720p just export as they are.
+    PortalChoices choices;
     if (!scaleHeights.isEmpty()) {
         PortalChoiceOptions qualities = {{QStringLiteral("original"), QStringLiteral("Original")}};
         for (const int height : scaleHeights)
             qualities.append({QString::number(height), QStringLiteral("%1p").arg(height)});
-        options.insert(QStringLiteral("choices"),
-                       QVariant::fromValue(PortalChoices{{QStringLiteral("quality"),
-                                                          QStringLiteral("Quality"),
-                                                          qualities,
-                                                          QStringLiteral("original")}}));
+        choices.append({QStringLiteral("quality"), QStringLiteral("Quality"), qualities,
+                        QStringLiteral("original")});
     }
+    // And a "Subtitles" combo when the clip has captions: they are always burned
+    // into the picture, and this asks for the .srt beside it as well.
+    if (offerSidecar) {
+        choices.append({QStringLiteral("subtitles"), QStringLiteral("Subtitles"),
+                        {{QStringLiteral("burned"), QStringLiteral("Burned in")},
+                         {QStringLiteral("sidecar"), QStringLiteral("Burned in + .srt file")}},
+                        QStringLiteral("burned")});
+    }
+    if (!choices.isEmpty())
+        options.insert(QStringLiteral("choices"), QVariant::fromValue(choices));
 
     if (requestFile(QStringLiteral("SaveFile"), QStringLiteral("Save Video File"),
                     options, Action::Export)) {
@@ -307,9 +315,11 @@ void PortalFilePicker::handleResponse(uint response, const QVariantMap &results)
     if (action != Action::Export)
         return;
 
-    // The chosen quality rides along in the response: [("quality", "1080")],
-    // with "original" (or no choices at all) meaning no downscale.
+    // The combo choices ride along in the response: [("quality", "1080"),
+    // ("subtitles", "sidecar")], with "original" (or no choices at all) meaning
+    // no downscale and no sidecar.
     int scaleHeight = 0;
+    bool sidecar = false;
     const QVariant choicesVar = results.value(QStringLiteral("choices"));
     if (choicesVar.canConvert<QDBusArgument>()) {
         const QDBusArgument arg = choicesVar.value<QDBusArgument>();
@@ -322,10 +332,12 @@ void PortalFilePicker::handleResponse(uint response, const QVariantMap &results)
             arg.endStructure();
             if (id == QStringLiteral("quality"))
                 scaleHeight = value.toInt();  // "original" parses to 0
+            else if (id == QStringLiteral("subtitles"))
+                sidecar = value == QStringLiteral("sidecar");
         }
         arg.endArray();
     }
-    emit exportSelected(url, start, end, scaleHeight);
+    emit exportSelected(url, start, end, scaleHeight, sidecar);
 }
 
 void PortalFilePicker::clearPending() {

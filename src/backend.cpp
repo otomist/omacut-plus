@@ -30,6 +30,11 @@ QString omarchyColorsPath() {
     return omarchyCurrentDir() + QStringLiteral("/theme/colors.toml");
 }
 
+QString srtPathFor(const QString &videoPath) {
+    const QFileInfo video(videoPath);
+    return video.dir().filePath(video.completeBaseName() + QStringLiteral(".srt"));
+}
+
 QString mp4PathFor(const QString &path) {
     const QFileInfo file(path);
     if (file.suffix().compare(QStringLiteral("mp4"), Qt::CaseInsensitive) == 0)
@@ -200,7 +205,8 @@ void Backend::exportDialog(double start, double end) {
         return;
 
     m_filePicker->exportVideo(suggestedExportUrl(), start, end,
-                              exportHeights(m_info.width, m_info.height));
+                              exportHeights(m_info.width, m_info.height),
+                              hasCaptionsIn(start, end));
 }
 
 QList<int> Backend::exportHeights(int width, int height) {
@@ -349,7 +355,26 @@ std::unique_ptr<QTemporaryFile> Backend::writeCaptionFile(double start, double e
     return file;
 }
 
-void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHeight) {
+QString Backend::writeSidecar(const QString &videoPath, const QString &document) {
+    const QString path = srtPathFor(videoPath);
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text))
+        return {};
+
+    QTextStream out(&file);
+    out.setEncoding(QStringConverter::Utf8);
+    out << document;
+    out.flush();
+    if (file.error() != QFileDevice::NoError) {
+        file.close();
+        QFile::remove(path);
+        return {};
+    }
+    return path;
+}
+
+void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHeight,
+                         bool sidecar) {
     if (m_path.isEmpty() || !m_info.ok || m_busy)
         return;
 
@@ -384,6 +409,12 @@ void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHei
         emit exportFailed(QStringLiteral("Could not write the captions for this export."));
         return;
     }
+
+    // Built here, written only once the video is safely in place: a failed
+    // export must not replace an .srt that is already sitting there.
+    const QString srtDocument = sidecar && burnsCaptions
+        ? subtitles::buildSrt(m_cues, start, end)
+        : QString();
 
     setBusy(true);
     setStatus(QStringLiteral("Exporting 0%"));
@@ -421,7 +452,7 @@ void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHei
             });
 
     connect(proc, &QProcess::finished, this,
-            [this, proc, outPath, tmpPath, completed, captionFile](int code, QProcess::ExitStatus exitStatus) {
+            [this, proc, outPath, tmpPath, completed, captionFile, srtDocument](int code, QProcess::ExitStatus exitStatus) {
                 if (*completed)
                     return;
                 *completed = true;
@@ -437,7 +468,15 @@ void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHei
                 }
                 setBusy(false);
                 setStatus(QString());
-                emit exportDone(outPath);
+
+                QString srtPath;
+                if (!srtDocument.isEmpty()) {
+                    srtPath = writeSidecar(outPath, srtDocument);
+                    if (srtPath.isEmpty())
+                        emit exportWarning(QStringLiteral("%1 was saved, but its .srt could not be written.")
+                                               .arg(QFileInfo(outPath).fileName()));
+                }
+                emit exportDone(outPath, srtPath);
             });
     connect(proc, &QProcess::errorOccurred, this,
             [this, proc, tmpPath, completed, captionFile](QProcess::ProcessError error) {
