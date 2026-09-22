@@ -33,4 +33,5 @@ private:
     Action m_pendingAction = Action::None;
     double m_pendingExportStart = 0;
     double m_pendingExportEnd = 0;
+    bool m_pendingOfferedSidecar = false;
 };

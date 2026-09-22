@@ -46,10 +46,10 @@ left out of the export.
 
 When the clip has captions, the export dialog also offers a **Subtitles** choice:
 
-- *Burned in* — just the video.
-- *Burned in + .srt file* — also writes `<name>.srt` next to the video, holding each caption's text
-  and timing. The times are relative to the exported clip, so the file drops straight into a player,
-  YouTube or another editor.
+- *Burned in + .srt file* (the default) — also writes `<name>.srt` next to the video, holding each
+  caption's text and timing. The times are relative to the exported clip, so the file drops straight
+  into a player, YouTube or another editor.
+- *Burned in only* — just the video.
 
 A failed export never touches an `.srt` that was already there.
 

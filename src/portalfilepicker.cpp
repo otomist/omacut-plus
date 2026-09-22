@@ -202,12 +202,13 @@ void PortalFilePicker::exportVideo(const QUrl &suggestedUrl, double start, doubl
                         QStringLiteral("original")});
     }
     // And a "Subtitles" combo when the clip has captions: they are always burned
-    // into the picture, and this asks for the .srt beside it as well.
+    // into the picture, and the .srt beside it comes along by default — the
+    // other entry is for when you only want the video.
     if (offerSidecar) {
         choices.append({QStringLiteral("subtitles"), QStringLiteral("Subtitles"),
-                        {{QStringLiteral("burned"), QStringLiteral("Burned in")},
-                         {QStringLiteral("sidecar"), QStringLiteral("Burned in + .srt file")}},
-                        QStringLiteral("burned")});
+                        {{QStringLiteral("sidecar"), QStringLiteral("Burned in + .srt file")},
+                         {QStringLiteral("burned"), QStringLiteral("Burned in only")}},
+                        QStringLiteral("sidecar")});
     }
     if (!choices.isEmpty())
         options.insert(QStringLiteral("choices"), QVariant::fromValue(choices));
@@ -216,6 +217,7 @@ void PortalFilePicker::exportVideo(const QUrl &suggestedUrl, double start, doubl
                     options, Action::Export)) {
         m_pendingExportStart = start;
         m_pendingExportEnd = end;
+        m_pendingOfferedSidecar = offerSidecar;
     }
 }
 
@@ -298,6 +300,7 @@ void PortalFilePicker::handleResponse(uint response, const QVariantMap &results)
     const Action action = m_pendingAction;
     const double start = m_pendingExportStart;
     const double end = m_pendingExportEnd;
+    const bool offeredSidecar = m_pendingOfferedSidecar;
     clearPending();
 
     if (response != 0)
@@ -316,10 +319,11 @@ void PortalFilePicker::handleResponse(uint response, const QVariantMap &results)
         return;
 
     // The combo choices ride along in the response: [("quality", "1080"),
-    // ("subtitles", "sidecar")], with "original" (or no choices at all) meaning
-    // no downscale and no sidecar.
+    // ("subtitles", "sidecar")], with "original" meaning no downscale. The
+    // sidecar starts from what we offered, so the .srt still comes out if a
+    // portal backend hands the combos back empty.
     int scaleHeight = 0;
-    bool sidecar = false;
+    bool sidecar = offeredSidecar;
     const QVariant choicesVar = results.value(QStringLiteral("choices"));
     if (choicesVar.canConvert<QDBusArgument>()) {
         const QDBusArgument arg = choicesVar.value<QDBusArgument>();
@@ -350,4 +354,5 @@ void PortalFilePicker::clearPending() {
 
     m_pendingPath.clear();
     m_pendingAction = Action::None;
+    m_pendingOfferedSidecar = false;
 }
